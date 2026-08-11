@@ -1,0 +1,7 @@
+.env
+.env.*
+!.env.example
+密钥库.md
+**/密钥库.md
+*.pem
+*.key
