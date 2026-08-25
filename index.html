@@ -6,252 +6,97 @@
   <title>关键词作战工具</title>
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
   <style>
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      font-family: Arial, "Microsoft YaHei", sans-serif;
-      background: #f4f7fb;
-      color: #172033;
-    }
-    .wrap { max-width: 880px; margin: 40px auto; padding: 20px; }
-    .card {
-      background: white;
-      border-radius: 14px;
-      padding: 24px;
-      margin-bottom: 20px;
-      box-shadow: 0 8px 30px rgba(30, 60, 100, .08);
-    }
-    h1 { margin: 0 0 8px; }
-    h2 { font-size: 19px; margin-top: 0; }
-    .muted { color: #718096; font-size: 14px; }
-    input, button {
-      width: 100%;
-      padding: 12px;
-      margin-top: 10px;
-      border-radius: 8px;
-      border: 1px solid #d7deea;
-      font-size: 15px;
-    }
-    button {
-      border: 0;
-      color: white;
-      background: #1677ff;
-      cursor: pointer;
-      font-weight: 600;
-    }
-    button.secondary { background: #667085; }
-    button:disabled { opacity: .55; cursor: not-allowed; }
-    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-    .hidden { display: none; }
-    .message { margin-top: 12px; font-size: 14px; }
-    .task {
-      border-top: 1px solid #edf0f5;
-      padding: 14px 0;
-      line-height: 1.7;
-    }
-    .status { font-weight: 700; color: #1677ff; }
-    .failed { color: #d92d20; }
-    .done { color: #079455; }
-    a { color: #1677ff; }
-    @media (max-width: 620px) {
-      .row { grid-template-columns: 1fr; }
-      .wrap { margin: 10px auto; padding: 12px; }
-    }
+    *{box-sizing:border-box}body{margin:0;font-family:Arial,"Microsoft YaHei",sans-serif;background:#f4f7fb;color:#172033}.wrap{max-width:880px;margin:40px auto;padding:20px}.card{background:#fff;border-radius:14px;padding:24px;margin-bottom:20px;box-shadow:0 8px 30px rgba(30,60,100,.08)}h1{margin:0 0 8px}h2{font-size:19px;margin-top:0}.muted{color:#718096;font-size:14px}input,button{width:100%;padding:12px;margin-top:10px;border-radius:8px;border:1px solid #d7deea;font-size:15px}button{border:0;color:#fff;background:#1677ff;cursor:pointer;font-weight:600}button.secondary{background:#667085}button:disabled{opacity:.55;cursor:not-allowed}.row{display:grid;grid-template-columns:1fr 1fr;gap:12px}.hidden{display:none}.message{margin-top:12px;font-size:14px}.forgot{display:block;width:max-content;margin:12px 0 2px auto;color:#1677ff;text-decoration:none;font-size:14px}.forgot:hover{text-decoration:underline}.task{border-top:1px solid #edf0f5;padding:14px 0;line-height:1.7}.status{font-weight:700;color:#1677ff}.failed{color:#d92d20}.done{color:#079455}a{color:#1677ff}@media(max-width:620px){.row{grid-template-columns:1fr}.wrap{margin:10px auto;padding:12px}}
   </style>
 </head>
 <body>
   <main class="wrap">
-    <div class="card">
-      <h1>关键词作战工具</h1>
-      <div class="muted">上传广告搜索词报告，创建自动分析任务。</div>
-    </div>
-
+    <div class="card"><h1>关键词作战工具</h1><div class="muted">上传广告搜索词报告，创建自动分析任务。</div></div>
     <section id="authCard" class="card">
       <h2>登录</h2>
-      <input id="email" type="email" placeholder="邮箱">
-      <input id="password" type="password" placeholder="密码">
-      <div class="row">
-        <button onclick="login()">登录</button>
-        <button class="secondary" onclick="signup()">注册</button>
-      </div>
-      <div id="authMessage" class="message"></div>
+      <input id="email" type="email" autocomplete="email" placeholder="邮箱">
+      <input id="password" type="password" autocomplete="current-password" placeholder="密码">
+      <a class="forgot" href="#" onclick="forgotPassword(event)">忘记密码？</a>
+      <div class="row"><button id="loginButton" onclick="login()">登录</button><button class="secondary" onclick="signup()">注册</button></div>
+      <div id="authMessage" class="message" role="status"></div>
     </section>
-
     <section id="appCard" class="card hidden">
-      <div class="row">
-        <div>
-          <h2>新建分析任务</h2>
-          <div id="currentUser" class="muted"></div>
-        </div>
-        <div>
-          <button class="secondary" onclick="logout()">退出登录</button>
-        </div>
-      </div>
-
+      <div class="row"><div><h2>新建分析任务</h2><div id="currentUser" class="muted"></div></div><div><button class="secondary" onclick="logout()">退出登录</button></div></div>
       <input id="asin" placeholder="输入 ASIN，例如 B0XXXXXXXX">
       <input id="reportFile" type="file" accept=".csv,.xlsx">
       <button id="submitButton" onclick="createTask()">上传并创建任务</button>
       <div id="taskMessage" class="message"></div>
     </section>
-
-    <section id="listCard" class="card hidden">
-      <h2>我的任务</h2>
-      <div id="taskList" class="muted">正在读取……</div>
-    </section>
+    <section id="listCard" class="card hidden"><h2>我的任务</h2><div id="taskList" class="muted">正在读取……</div></section>
   </main>
-
   <script>
-    const SUPABASE_URL = 'https://cwqelnkhcscrozlggcim.supabase.co';
-    const SUPABASE_KEY = 'sb_publishable_TnkdSnkam2DaK1_K5YwGpw_gRoGUYkN';
-    const client = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+    const SUPABASE_URL='https://cwqelnkhcscrozlggcim.supabase.co';
+    const SUPABASE_KEY='sb_publishable_TnkdSnkam2DaK1_K5YwGpw_gRoGUYkN';
+    const client=supabase.createClient(SUPABASE_URL,SUPABASE_KEY);
+    const showMessage=(id,text,error=false)=>{const el=document.getElementById(id);el.textContent=text;el.style.color=error?'#d92d20':'#079455'};
+    const validEmail=email=>/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
 
-    const showMessage = (id, text, error = false) => {
-      const el = document.getElementById(id);
-      el.textContent = text;
-      el.style.color = error ? '#d92d20' : '#079455';
-    };
-
-    async function login() {
-      const email = document.getElementById('email').value.trim();
-      const password = document.getElementById('password').value;
-      const { error } = await client.auth.signInWithPassword({ email, password });
-
-      if (error) return showMessage('authMessage', error.message, true);
-      showMessage('authMessage', '登录成功');
-      refreshPage();
+    async function login(){
+      const button=document.getElementById('loginButton');
+      const email=document.getElementById('email').value.trim();
+      const password=document.getElementById('password').value;
+      if(!validEmail(email))return showMessage('authMessage','请输入正确的邮箱地址',true);
+      if(!password)return showMessage('authMessage','请输入密码',true);
+      button.disabled=true;showMessage('authMessage','正在登录……');
+      const{error}=await client.auth.signInWithPassword({email,password});button.disabled=false;
+      if(error)return showMessage('authMessage','邮箱或密码不正确',true);
+      showMessage('authMessage','登录成功');refreshPage();
     }
 
-    async function signup() {
-      const email = document.getElementById('email').value.trim();
-      const password = document.getElementById('password').value;
-      const { error } = await client.auth.signUp({ email, password });
-
-      if (error) return showMessage('authMessage', error.message, true);
-      showMessage('authMessage', '注册成功，请前往邮箱完成验证');
+    async function signup(){
+      const email=document.getElementById('email').value.trim();
+      const password=document.getElementById('password').value;
+      if(!validEmail(email))return showMessage('authMessage','请输入正确的邮箱地址',true);
+      if(password.length<8)return showMessage('authMessage','密码至少需要 8 位',true);
+      const{error}=await client.auth.signUp({email,password});
+      if(error)return showMessage('authMessage',error.message,true);
+      showMessage('authMessage','注册成功，请前往邮箱完成验证');
     }
 
-    async function logout() {
-      await client.auth.signOut();
-      refreshPage();
+    async function forgotPassword(event){
+      event.preventDefault();
+      const email=document.getElementById('email').value.trim();
+      if(!validEmail(email))return showMessage('authMessage','请先在邮箱框填写正确的注册邮箱',true);
+      showMessage('authMessage','正在发送重置邮件……');
+      const{error}=await client.auth.resetPasswordForEmail(email,{redirectTo:'https://www.xmenshu.com/reset-password.html'});
+      if(error)return showMessage('authMessage','发送失败，请稍后重试',true);
+      showMessage('authMessage','如果该邮箱已注册，重置密码邮件已发送，请检查收件箱和垃圾邮件');
     }
 
-    async function refreshPage() {
-      const { data: { user } } = await client.auth.getUser();
-      const loggedIn = Boolean(user);
-
-      document.getElementById('authCard').classList.toggle('hidden', loggedIn);
-      document.getElementById('appCard').classList.toggle('hidden', !loggedIn);
-      document.getElementById('listCard').classList.toggle('hidden', !loggedIn);
-
-      if (user) {
-        document.getElementById('currentUser').textContent = user.email;
-        loadTasks();
-      }
+    async function logout(){await client.auth.signOut();refreshPage()}
+    async function refreshPage(){
+      const{data:{user}}=await client.auth.getUser();const loggedIn=Boolean(user);
+      document.getElementById('authCard').classList.toggle('hidden',loggedIn);
+      document.getElementById('appCard').classList.toggle('hidden',!loggedIn);
+      document.getElementById('listCard').classList.toggle('hidden',!loggedIn);
+      if(user){document.getElementById('currentUser').textContent=user.email;loadTasks()}
     }
 
-    async function createTask() {
-      const button = document.getElementById('submitButton');
-      const asin = document.getElementById('asin').value.trim().toUpperCase();
-      const file = document.getElementById('reportFile').files[0];
-
-      if (!asin) return showMessage('taskMessage', '请填写 ASIN', true);
-      if (!file) return showMessage('taskMessage', '请选择 CSV 或 XLSX 文件', true);
-
-      const extension = file.name.split('.').pop().toLowerCase();
-      if (!['csv', 'xlsx'].includes(extension)) {
-        return showMessage('taskMessage', '只允许上传 CSV 或 XLSX 文件', true);
-      }
-
-      button.disabled = true;
-      showMessage('taskMessage', '正在上传……');
-
-      try {
-        const { data: { user } } = await client.auth.getUser();
-        if (!user) throw new Error('请先登录');
-
-        const taskId = crypto.randomUUID();
-        const reportPath = `${user.id}/${taskId}.${extension}`;
-
-        const { error: uploadError } = await client.storage
-          .from('keyword-task-inbox')
-          .upload(reportPath, file, { upsert: false });
-
-        if (uploadError) throw uploadError;
-
-        const { error: insertError } = await client
-          .from('keyword_tasks')
-          .insert({
-            id: taskId,
-            user_id: user.id,
-            asin,
-            report_path: reportPath,
-            status: '待处理'
-          });
-
-        if (insertError) throw insertError;
-
-        document.getElementById('asin').value = '';
-        document.getElementById('reportFile').value = '';
-        showMessage('taskMessage', '任务创建成功，服务器即将开始处理');
-        loadTasks();
-      } catch (error) {
-        showMessage('taskMessage', error.message, true);
-      } finally {
-        button.disabled = false;
-      }
+    async function createTask(){
+      const button=document.getElementById('submitButton');const asin=document.getElementById('asin').value.trim().toUpperCase();const file=document.getElementById('reportFile').files[0];
+      if(!asin)return showMessage('taskMessage','请填写 ASIN',true);if(!file)return showMessage('taskMessage','请选择 CSV 或 XLSX 文件',true);
+      const extension=file.name.split('.').pop().toLowerCase();if(!['csv','xlsx'].includes(extension))return showMessage('taskMessage','只允许上传 CSV 或 XLSX 文件',true);
+      button.disabled=true;showMessage('taskMessage','正在上传……');
+      try{
+        const{data:{user}}=await client.auth.getUser();if(!user)throw new Error('请先登录');
+        const taskId=crypto.randomUUID();const reportPath=`${user.id}/${taskId}.${extension}`;
+        const{error:uploadError}=await client.storage.from('keyword-task-inbox').upload(reportPath,file,{upsert:false});if(uploadError)throw uploadError;
+        const{error:insertError}=await client.from('keyword_tasks').insert({id:taskId,user_id:user.id,asin,report_path:reportPath,status:'待处理'});if(insertError)throw insertError;
+        document.getElementById('asin').value='';document.getElementById('reportFile').value='';showMessage('taskMessage','任务创建成功，服务器即将开始处理');loadTasks();
+      }catch(error){showMessage('taskMessage',error.message,true)}finally{button.disabled=false}
     }
 
-    async function loadTasks() {
-      const list = document.getElementById('taskList');
-
-      const { data, error } = await client
-        .from('keyword_tasks')
-        .select('id,asin,status,failure_reason,report_url,created_at')
-        .order('created_at', { ascending: false })
-        .limit(30);
-
-      if (error) {
-        list.textContent = `读取失败：${error.message}`;
-        return;
-      }
-
-      if (!data || data.length === 0) {
-        list.textContent = '暂无任务';
-        return;
-      }
-
-      list.innerHTML = data.map(task => {
-        const statusClass =
-          task.status === '已完成' ? 'done' :
-          task.status === '失败' ? 'failed' : 'status';
-
-        const report = task.report_url
-          ? `<div><a href="${task.report_url}" target="_blank">打开分析报告</a></div>`
-          : '';
-
-        const failure = task.failure_reason
-          ? `<div class="failed">失败原因：${task.failure_reason}</div>`
-          : '';
-
-        return `
-          <div class="task">
-            <div><strong>${task.asin}</strong></div>
-            <div class="${statusClass}">状态：${task.status}</div>
-            <div class="muted">创建时间：${new Date(task.created_at).toLocaleString()}</div>
-            ${failure}
-            ${report}
-          </div>
-        `;
-      }).join('');
+    async function loadTasks(){
+      const list=document.getElementById('taskList');const{data,error}=await client.from('keyword_tasks').select('id,asin,status,failure_reason,report_url,created_at').order('created_at',{ascending:false}).limit(30);
+      if(error){list.textContent=`读取失败：${error.message}`;return}if(!data||data.length===0){list.textContent='暂无任务';return}
+      list.innerHTML=data.map(task=>{const statusClass=task.status==='已完成'?'done':task.status==='失败'?'failed':'status';const report=task.report_url?`<div><a href="${task.report_url}" target="_blank" rel="noopener">打开分析报告</a></div>`:'';const failure=task.failure_reason?`<div class="failed">失败原因：${task.failure_reason}</div>`:'';return `<div class="task"><div><strong>${task.asin}</strong></div><div class="${statusClass}">状态：${task.status}</div><div class="muted">创建时间：${new Date(task.created_at).toLocaleString()}</div>${failure}${report}</div>`}).join('');
     }
-
-    client.auth.onAuthStateChange(() => refreshPage());
-    refreshPage();
-    setInterval(() => {
-      if (!document.getElementById('listCard').classList.contains('hidden')) {
-        loadTasks();
-      }
-    }, 30000);
+    client.auth.onAuthStateChange(()=>refreshPage());refreshPage();setInterval(()=>{if(!document.getElementById('listCard').classList.contains('hidden'))loadTasks()},30000);
   </script>
 </body>
 </html>
