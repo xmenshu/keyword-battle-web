@@ -1,0 +1,837 @@
+require('dotenv').config();
+
+const { createClient } = require('@supabase/supabase-js');
+const COS = require('cos-nodejs-sdk-v5');
+const XLSX = require('xlsx');
+
+const INBOX_BUCKET = 'keyword-task-inbox';
+const KEYWORD_LIMIT = 20;
+const REPORT_URL_EXPIRES_SECONDS = 3600;
+const POLL_INTERVAL_MS = 30000;
+const URL_REFRESH_INTERVAL_MS = 30 * 60 * 1000;
+
+const requiredVars = [
+  'SUPABASE_URL',
+  'SUPABASE_SERVICE_ROLE_KEY',
+  'TENCENT_SECRET_ID',
+  'TENCENT_SECRET_KEY',
+  'COS_REGION',
+  'COS_BUCKET',
+  'COS_REPORT_PREFIX',
+  'SIF_MCP_URL'
+];
+
+for (const name of requiredVars) {
+  if (!process.env[name]) {
+    console.error(`缺少环境变量：${name}`);
+    process.exit(1);
+  }
+}
+
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY,
+  { auth: { persistSession: false, autoRefreshToken: false } }
+);
+
+const cos = new COS({
+  SecretId: process.env.TENCENT_SECRET_ID,
+  SecretKey: process.env.TENCENT_SECRET_KEY
+});
+
+let polling = false;
+let refreshingUrls = false;
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function putObject(params) {
+  return new Promise((resolve, reject) => {
+    cos.putObject(params, (error, data) => error ? reject(error) : resolve(data));
+  });
+}
+
+function getSignedObjectUrl(objectKey) {
+  return new Promise((resolve, reject) => {
+    cos.getObjectUrl({
+      Bucket: process.env.COS_BUCKET,
+      Region: process.env.COS_REGION,
+      Key: objectKey,
+      Sign: true,
+      Expires: REPORT_URL_EXPIRES_SECONDS
+    }, (error, data) => error ? reject(error) : resolve(data.Url));
+  });
+}
+
+function reportObjectKey(task) {
+  const prefix = process.env.COS_REPORT_PREFIX.replace(/^\/+|\/+$/g, '');
+  return `${prefix}/${task.user_id}/${task.id}.html`;
+}
+
+function normalizeHeader(value) {
+  return String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[\s_\-()（）/#＃]+/g, '');
+}
+
+function numberValue(value) {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  const cleaned = String(value ?? '')
+    .replace(/[$￥¥,%\s,]/g, '')
+    .trim();
+  const parsed = Number(cleaned);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function firstMatchingHeader(headers, aliases) {
+  const normalizedAliases = aliases.map(normalizeHeader);
+  return headers.find(header => normalizedAliases.includes(normalizeHeader(header)));
+}
+
+function parseAdvertisingWorkbook(buffer, reportPath) {
+  const workbook = XLSX.read(buffer, {
+    type: 'buffer',
+    raw: false,
+    codepage: 65001
+  });
+
+  const aliases = {
+    term: ['搜索词', '客户搜索词', '顾客搜索词', 'search term', 'customer search term'],
+    impressions: ['曝光量', '曝光', '展示量', 'impressions'],
+    clicks: ['点击量', '点击', 'clicks'],
+    spend: ['花费', '支出', '广告花费', 'spend', 'cost'],
+    orders: ['7天总订单数', '14天总订单数', '订单量', '订单', 'orders', 'total orders'],
+    sales: ['7天总销售额', '14天总销售额', '销售额', '广告销售额', 'sales', 'total sales']
+  };
+
+  let selected = null;
+
+  for (const sheetName of workbook.SheetNames) {
+    const rows = XLSX.utils.sheet_to_json(workbook.Sheets[sheetName], {
+      defval: '',
+      raw: false
+    });
+    if (!rows.length) continue;
+    const headers = Object.keys(rows[0]);
+    const mapping = {};
+    for (const [field, choices] of Object.entries(aliases)) {
+      mapping[field] = firstMatchingHeader(headers, choices);
+    }
+    if (mapping.term) {
+      selected = { sheetName, rows, headers, mapping };
+      break;
+    }
+  }
+
+  if (!selected) {
+    const sheetNames = workbook.SheetNames.join('、');
+    throw new Error(`广告报表未识别到“搜索词”列。文件：${reportPath}；工作表：${sheetNames}`);
+  }
+
+  const aggregate = new Map();
+  for (const row of selected.rows) {
+    const keyword = String(row[selected.mapping.term] || '').trim().toLowerCase();
+    if (!keyword) continue;
+    const current = aggregate.get(keyword) || {
+      impressions: 0,
+      clicks: 0,
+      spend: 0,
+      orders: 0,
+      sales: 0
+    };
+    for (const field of ['impressions', 'clicks', 'spend', 'orders', 'sales']) {
+      if (selected.mapping[field]) current[field] += numberValue(row[selected.mapping[field]]);
+    }
+    aggregate.set(keyword, current);
+  }
+
+  return {
+    sheetName: selected.sheetName,
+    headers: selected.headers,
+    mapping: selected.mapping,
+    aggregate
+  };
+}
+
+async function downloadAdvertisingReport(task) {
+  const { data, error } = await supabase.storage
+    .from(INBOX_BUCKET)
+    .download(task.report_path);
+  if (error) throw new Error(`下载广告报表失败：${error.message}`);
+  return Buffer.from(await data.arrayBuffer());
+}
+
+async function callSifTool(name, args, attempts = 3) {
+  let lastError;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      const response = await fetch(process.env.SIF_MCP_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json, text/event-stream'
+        },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: `${Date.now()}-${attempt}`,
+          method: 'tools/call',
+          params: { name, arguments: args }
+        }),
+        signal: AbortSignal.timeout(90000)
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const envelope = await response.json();
+      if (envelope.error) throw new Error(JSON.stringify(envelope.error));
+      if (envelope.result?.isError) {
+        throw new Error(envelope.result.content?.[0]?.text || `${name} 返回错误`);
+      }
+      const text = envelope.result?.content?.[0]?.text;
+      if (!text) throw new Error(`${name} 没有返回内容`);
+      return JSON.parse(text);
+    } catch (error) {
+      lastError = error;
+      if (attempt < attempts) await sleep(attempt * 1000);
+    }
+  }
+  throw new Error(`${name} 调用失败：${lastError.message}`);
+}
+
+function objectsWithKeyword(value, output = []) {
+  if (!value || typeof value !== 'object') return output;
+  if (!Array.isArray(value) && typeof value.keyword === 'string') output.push(value);
+  for (const child of Object.values(value)) objectsWithKeyword(child, output);
+  return output;
+}
+
+function keywordIndex(payload) {
+  const index = new Map();
+  for (const item of objectsWithKeyword(payload)) {
+    const key = item.keyword.trim().toLowerCase();
+    const existing = index.get(key) || {};
+    index.set(key, { ...existing, ...item });
+  }
+  return index;
+}
+
+function rankText(value) {
+  if (value === null || value === undefined || value === '') return '—';
+  return String(value);
+}
+
+function trendText(row) {
+  const direction = row.trend?.direction || row.momentum || row.contri_severity;
+  const map = {
+    growing: '增长',
+    declining: '下降',
+    stable: '稳定',
+    volatile: '波动',
+    accelerating: '加速增长',
+    falling: '季节性回落',
+    flat: '平稳',
+    insufficient: '数据不足'
+  };
+  return map[direction] || String(direction || '数据不足');
+}
+
+function extractAsin(value) {
+  const match = String(value || '').toUpperCase().match(/B0[A-Z0-9]{8}/);
+  return match ? match[0] : '';
+}
+
+function highestChannelShare(competitor) {
+  if (!competitor) return 0;
+  return Math.max(
+    numberValue(competitor.organic_share),
+    numberValue(competitor.sp_share),
+    numberValue(competitor.brand_share),
+    numberValue(competitor.video_share)
+  );
+}
+
+function median(values) {
+  const sorted = values.filter(Number.isFinite).sort((a, b) => a - b);
+  if (!sorted.length) return 0;
+  const middle = Math.floor(sorted.length / 2);
+  return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
+}
+
+function firstFiniteValue(value, aliases) {
+  if (!value || typeof value !== 'object') return null;
+  const wanted = new Set(aliases.map(alias => alias.toLowerCase()));
+  const queue = [value];
+  while (queue.length) {
+    const current = queue.shift();
+    if (!current || typeof current !== 'object') continue;
+    for (const [key, child] of Object.entries(current)) {
+      if (wanted.has(key.toLowerCase())) {
+        const number = Number(child);
+        if (Number.isFinite(number) && number > 0) return number;
+      }
+      if (child && typeof child === 'object') queue.push(child);
+    }
+  }
+  return null;
+}
+
+function sifBidEvidence(demand) {
+  const low = firstFiniteValue(demand, ['suggested_bid_low', 'suggested_bid_min', 'bid_low', 'min_bid', 'low_bid']);
+  const high = firstFiniteValue(demand, ['suggested_bid_high', 'suggested_bid_max', 'bid_high', 'max_bid', 'high_bid']);
+  const exact = firstFiniteValue(demand, ['suggested_bid', 'recommended_bid', 'suggest_bid', 'bid_suggestion', 'suggested_cpc']);
+  const midpoint = exact || (low && high ? (low + high) / 2 : low || high || null);
+  return { low, high, midpoint };
+}
+
+function arrayByAliases(value, aliases) {
+  if (!value || typeof value !== 'object') return [];
+  const wanted = new Set(aliases.map(alias => alias.toLowerCase()));
+  const queue = [value];
+  while (queue.length) {
+    const current = queue.shift();
+    if (!current || typeof current !== 'object') continue;
+    for (const [key, child] of Object.entries(current)) {
+      if (wanted.has(key.toLowerCase()) && Array.isArray(child)) return child;
+      if (child && typeof child === 'object') queue.push(child);
+    }
+  }
+  return [];
+}
+
+function latestPair(values) {
+  const usable = values.map(numberValue).filter(Number.isFinite);
+  if (usable.length < 2) return { previous: null, current: usable.at(-1) ?? null, change: null, rate: null };
+  const previous = usable.at(-2);
+  const current = usable.at(-1);
+  return {
+    previous,
+    current,
+    change: current - previous,
+    rate: previous ? (current - previous) / previous : null
+  };
+}
+
+function marketHistorySummary(history) {
+  const volume = latestPair(arrayByAliases(history, ['volumes', 'search_volumes', 'search_volume_history']));
+  const abaRank = latestPair(arrayByAliases(history, ['ranks', 'aba_ranks', 'rank_history']));
+  const clickShare = latestPair(arrayByAliases(history, ['top3_click_shares', 'top3_click_share_history']));
+  const conversionShare = latestPair(arrayByAliases(history, ['top3_conversion_shares', 'top3_conversion_share_history']));
+  let label = '数据不足';
+  if (volume.rate !== null) {
+    if (volume.rate >= 0.10) label = '需求增长';
+    else if (volume.rate <= -0.10) label = '需求回落';
+    else label = '需求平稳';
+  }
+  return { volume, abaRank, clickShare, conversionShare, label };
+}
+
+async function getKeywordHistories(keywords) {
+  const result = new Map();
+  // SIF 此工具单次只接受 1–10 个词，按 10 个一组调用。
+  for (let start = 0; start < keywords.length; start += 10) {
+    const batch = keywords.slice(start, start + 10);
+    try {
+      const payload = await callSifTool('market_get_keyword_history', {
+        country: 'US', keywords: batch, time_type: 'lately', time_value: '7'
+      });
+      for (const item of payload.keywords || []) {
+        if (item?.keyword) result.set(String(item.keyword).trim().toLowerCase(), item);
+      }
+    } catch (error) {
+      console.warn(`SIF 关键词历史 ${start + 1}-${start + batch.length} 缺失：${error.message}`);
+    }
+  }
+  return result;
+}
+
+const AD_RULES = Object.freeze({
+  targetAcos: 0.30,
+  harvestMinOrders: 2,
+  harvestP0Orders: 5,
+  negateMinClicks: 15,
+  negateMinSpend: 20,
+  lowCvr: 0.05,
+  bidSafetyFactor: 0.95,
+  harvestBidCap: 0.65
+});
+
+function deterministicDecision(row, highVolumeThreshold, observedAcos) {
+  const ads = row.ads;
+  const acos = ads.sales > 0 ? ads.spend / ads.sales : null;
+  const cpc = ads.clicks > 0 ? ads.spend / ads.clicks : null;
+  const cvr = ads.clicks > 0 ? ads.orders / ads.clicks : null;
+  const suggestedCpc = ads.clicks > 0 && ads.sales > 0
+    ? (ads.sales / ads.clicks) * AD_RULES.targetAcos * AD_RULES.bidSafetyFactor
+    : null;
+  const metrics = `点击 ${formatNumber(ads.clicks)}｜花费 $${formatNumber(ads.spend, 2)}｜订单 ${formatNumber(ads.orders)}｜CVR ${cvr === null ? '—' : `${(cvr * 100).toFixed(1)}%`}｜ACOS ${acos === null ? '—' : `${(acos * 100).toFixed(1)}%`}`;
+
+  if (ads.orders >= AD_RULES.harvestMinOrders && acos !== null && acos <= AD_RULES.targetAcos) {
+    const asinTarget = /^b0[a-z0-9]{8}$/i.test(row.keyword);
+    return {
+      priority: 3,
+      label: '加词承接',
+      suggestedCpc: Math.min(AD_RULES.harvestBidCap, cpc || AD_RULES.harvestBidCap),
+      advice: `${metrics}。已达到至少 ${AD_RULES.harvestMinOrders} 单且 ACOS 不高于目标 30%；${asinTarget ? '新建商品投放并复核否定 ASIN' : '新建精准匹配承接，稳定后在发现型活动中否定精准'}，观察 3–5 天。`
+    };
+  }
+  if (ads.orders <= 0 && (ads.clicks >= AD_RULES.negateMinClicks || ads.spend >= AD_RULES.negateMinSpend)) {
+    const asinTarget = /^b0[a-z0-9]{8}$/i.test(row.keyword);
+    return {
+      priority: 1,
+      label: '否词止损',
+      suggestedCpc: null,
+      advice: `${metrics}。零订单且已达到 ${ads.clicks >= AD_RULES.negateMinClicks ? `${AD_RULES.negateMinClicks} 次点击线` : `$${AD_RULES.negateMinSpend} 花费线`}；先核对相关性，${asinTarget ? '执行否定 ASIN 或暂停商品投放' : '执行否定精准'}，不要仅凭低 CTR 否词。`
+    };
+  }
+  if (ads.orders > 0 && acos !== null && observedAcos > 0 && acos > observedAcos) {
+    return {
+      priority: 2,
+      label: '降价控本',
+      suggestedCpc,
+      advice: `${metrics}。ACOS 高于整份报表实际 ACOS ${(observedAcos * 100).toFixed(1)}%；建议 CPC 调至 $${formatNumber(suggestedCpc, 2)} 左右，下降后观察 3–5 天。`
+    };
+  }
+  if (ads.orders > 0 && acos !== null && acos > AD_RULES.targetAcos) {
+    return {
+      priority: 2,
+      label: '小幅降价',
+      suggestedCpc,
+      advice: `${metrics}。有转化但 ACOS 高于目标 30%；建议 CPC 调至 $${formatNumber(suggestedCpc, 2)} 左右，不直接暂停，观察 3–5 天。`
+    };
+  }
+  if (ads.orders === 1 && acos !== null && acos <= AD_RULES.targetAcos) {
+    return { priority: 5, label: '继续观察', suggestedCpc: cpc, advice: `${metrics}。目前仅 1 单，成本暂时达标但样本不足；保持竞价，累计到 2 单后再决定是否转精准承接。` };
+  }
+  if (row.searchVolume >= highVolumeThreshold && ads.spend <= 0) {
+    const concentrated = row.topCompetitorShare >= 0.35;
+    return concentrated
+      ? { priority: 4, label: '长尾切入', suggestedCpc: null, advice: `月搜索量 ${formatNumber(row.searchVolume)}，但头部竞品最高渠道份额 ${(row.topCompetitorShare * 100).toFixed(1)}%；不高价硬抢，先测试相关长尾词和词组匹配。` }
+      : { priority: 4, label: '新增测试', suggestedCpc: null, advice: `月搜索量 ${formatNumber(row.searchVolume)}，当前报表无花费；使用小预算精准或词组匹配测试，至少积累 ${AD_RULES.negateMinClicks} 次点击再判断。` };
+  }
+  if (/p1,[1-5]\//.test(String(row.organicRank || ''))) {
+    return { priority: 5, label: '守自然位', suggestedCpc: cpc, advice: `${metrics}。自然排名位于首页前 5，但广告证据不足；维持低风险投放守位，不因短期数据直接放量。` };
+  }
+  return { priority: 6, label: '继续观察', suggestedCpc: cpc, advice: `${metrics}。尚未达到止损、承接或降价门槛；保持现状，累计到 ${AD_RULES.negateMinClicks} 次点击或新增订单后复核。` };
+}
+
+async function getDoubaoDecisions(rows) {
+  if (!process.env.DOUBAO_API_KEY || !process.env.DOUBAO_MODEL) return null;
+  const endpoint = process.env.DOUBAO_API_URL || 'https://ark.cn-beijing.volces.com/api/v3/chat/completions';
+  const compact = rows.map(row => ({
+    keyword: row.keyword,
+    search_volume: row.searchVolume,
+    organic_rank: row.organicRank,
+    ad_rank: row.adRank,
+    top_competitor_share: row.topCompetitorShare,
+    spend: row.ads.spend,
+    orders: row.ads.orders,
+    sales: row.ads.sales,
+    acos: row.ads.sales > 0 ? row.ads.spend / row.ads.sales : null,
+    fallback_decision: row.decision.advice
+  }));
+
+  const prompt = `你是亚马逊美国站广告运营助手。只按以下规则判断，不自由发挥：\n` +
+    `1. 自己已进入点击前三且有订单：守住并适度放大。\n` +
+    `2. 搜索量高但头部竞品点击占比过度集中：不高价硬抢，优先布局长尾词。\n` +
+    `3. 广告高花费无订单：先降价或暂停，再检查 Listing 图片和相关性。\n` +
+    `4. 有订单且 ACOS 达标：提高预算，转精准匹配持续放量。\n` +
+    `5. 自然排名较好但广告表现差：控制广告投入，优先守自然位。\n` +
+    `返回严格 JSON 数组，每项仅含 keyword、label、advice；advice 一句话，不输出 Markdown。数据：${JSON.stringify(compact)}`;
+
+  try {
+    const response = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${process.env.DOUBAO_API_KEY}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        model: process.env.DOUBAO_MODEL,
+        temperature: 0.1,
+        messages: [{ role: 'user', content: prompt }]
+      }),
+      signal: AbortSignal.timeout(120000)
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}: ${await response.text()}`);
+    const payload = await response.json();
+    let content = payload.choices?.[0]?.message?.content || '';
+    content = content.replace(/^```(?:json)?\s*|\s*```$/g, '');
+    const parsed = JSON.parse(content);
+    if (!Array.isArray(parsed)) throw new Error('返回内容不是数组');
+    return new Map(parsed.map(item => [String(item.keyword || '').toLowerCase(), item]));
+  } catch (error) {
+    console.warn(`豆包判断失败，使用确定性规则：${error.message}`);
+    return null;
+  }
+}
+
+async function buildKeywordRows(task, adReport) {
+  console.log(`任务 ${task.id}：SIF 反查前 ${KEYWORD_LIMIT} 个关键词。`);
+  const signals = await callSifTool('market_get_asin_keyword_signals', {
+    asin: task.asin,
+    country: 'US',
+    time_type: 'lately',
+    time_value: '30',
+    topN: KEYWORD_LIMIT
+  });
+  const signalRows = Array.isArray(signals.top_keywords) ? signals.top_keywords : [];
+  if (!signalRows.length) throw new Error(`SIF 未返回 ${task.asin} 最近 30 天关键词数据`);
+
+  const keywords = signalRows.map(item => item.keyword).filter(Boolean).slice(0, KEYWORD_LIMIT);
+  console.log(`任务 ${task.id}：批量补齐 ${keywords.length} 个词的需求数据。`);
+  const demandPayload = await callSifTool('market_get_keyword_demand', {
+    country: 'US',
+    keywords
+  });
+  const demandByKeyword = keywordIndex(demandPayload);
+  console.log(`任务 ${task.id}：读取 ${keywords.length} 个词的 7 天市场趋势。`);
+  const historyByKeyword = await getKeywordHistories(keywords);
+  const competitionByKeyword = new Map();
+
+  for (let index = 0; index < keywords.length; index += 1) {
+    const keyword = keywords[index];
+    console.log(`任务 ${task.id}：竞争数据 ${index + 1}/${keywords.length} - ${keyword}`);
+    try {
+      const competition = await callSifTool('market_get_keyword_competition', {
+        asin: task.asin,
+        country: 'US',
+        keyword,
+        rank_evolution: true,
+        time_type: 'all'
+      });
+      competitionByKeyword.set(keyword.toLowerCase(), competition);
+    } catch (error) {
+      console.warn(`关键词 ${keyword} 竞争数据缺失：${error.message}`);
+    }
+    await sleep(400);
+  }
+
+  const searchVolumes = signalRows.map(row => numberValue(row.search_volume));
+  const highVolumeThreshold = median(searchVolumes);
+  const adTotals = [...adReport.aggregate.values()].reduce((total, item) => ({
+    spend: total.spend + numberValue(item.spend),
+    sales: total.sales + numberValue(item.sales)
+  }), { spend: 0, sales: 0 });
+  const observedAcos = adTotals.sales > 0 ? adTotals.spend / adTotals.sales : 0;
+  const rows = signalRows.map(signal => {
+    const keyword = signal.keyword.trim();
+    const demand = demandByKeyword.get(keyword.toLowerCase()) || {};
+    const history = historyByKeyword.get(keyword.toLowerCase()) || {};
+    const competition = competitionByKeyword.get(keyword.toLowerCase()) || {};
+    const topCompetitor = competition.top_competitors?.[0] || null;
+    const ads = adReport.aggregate.get(keyword.toLowerCase()) || {
+      impressions: 0,
+      clicks: 0,
+      spend: 0,
+      orders: 0,
+      sales: 0
+    };
+    const row = {
+      keyword,
+      searchVolume: numberValue(signal.search_volume || demand.search_volume),
+      trend: trendText(demand),
+      organicRank: signal.organic_rank,
+      adRank: signal.sp_rank,
+      trafficShare: numberValue(signal.traffic_share),
+      topCompetitorAsin: extractAsin(topCompetitor?.asin),
+      // SIF 的 total_share 会把多个广告/自然渠道相加，可能超过 100%。
+      // 报告改为展示该竞品占比最高的单一渠道，避免误读。
+      topCompetitorShare: highestChannelShare(topCompetitor),
+      topCompetitorPrice: numberValue(topCompetitor?.price),
+      topCompetitorOrganicRank: topCompetitor?.organic_rank ?? topCompetitor?.rank ?? null,
+      topCompetitorAdRank: topCompetitor?.sp_rank ?? topCompetitor?.ad_rank ?? null,
+      market7d: marketHistorySummary(history),
+      sifBid: sifBidEvidence(demand),
+      organic7d: latestPair(arrayByAliases(competition, ['my_organic_ranks', 'organic_ranks', 'organic_rank_history', 'natural_rank_history'])),
+      adRank7d: latestPair(arrayByAliases(competition, ['my_sp_ranks', 'sp_ranks', 'ad_rank_history', 'sponsored_rank_history'])),
+      ads
+    };
+    row.decision = deterministicDecision(row, highVolumeThreshold, observedAcos);
+    if (row.sifBid.midpoint) {
+      const currentCpc = ads.clicks > 0 ? ads.spend / ads.clicks : null;
+      const range = row.sifBid.low && row.sifBid.high
+        ? `$${formatNumber(row.sifBid.low, 2)}–$${formatNumber(row.sifBid.high, 2)}`
+        : `$${formatNumber(row.sifBid.midpoint, 2)}`;
+      row.decision.advice += ` SIF 市场建议竞价 ${range}${currentCpc ? `，当前 CPC $${formatNumber(currentCpc, 2)}` : ''}；该估算仅作竞价区间证据，不覆盖目标 ACOS 30% 的盈亏竞价。`;
+    }
+    return row;
+  });
+
+  // 豆包仅保留为辅助解释能力；确定性动作、优先级和建议 CPC 不允许被模型覆盖。
+  const doubao = await getDoubaoDecisions(rows);
+  if (doubao) {
+    for (const row of rows) {
+      const item = doubao.get(row.keyword.toLowerCase());
+      if (item?.advice) row.decision.aiNote = String(item.advice).slice(0, 300);
+    }
+  }
+
+  return rows.sort((a, b) =>
+    a.decision.priority - b.decision.priority ||
+    b.ads.spend - a.ads.spend ||
+    b.searchVolume - a.searchVolume
+  );
+}
+
+function escapeHtml(value) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function formatNumber(value, digits = 0) {
+  const number = numberValue(value);
+  return number.toLocaleString('en-US', {
+    minimumFractionDigits: digits,
+    maximumFractionDigits: digits
+  });
+}
+
+function signedPercent(rate) {
+  if (!Number.isFinite(rate)) return '—';
+  return `${rate >= 0 ? '+' : ''}${(rate * 100).toFixed(1)}%`;
+}
+
+function rankMovement(pair) {
+  if (!Number.isFinite(pair?.previous) || !Number.isFinite(pair?.current)) return '—';
+  const improvement = pair.previous - pair.current;
+  if (improvement === 0) return '持平';
+  return `${improvement > 0 ? '↑' : '↓'}${Math.abs(improvement)}位`;
+}
+
+function renderHtmlReport(task, rows, adReport) {
+  const totalSpend = rows.reduce((sum, row) => sum + row.ads.spend, 0);
+  const totalSales = rows.reduce((sum, row) => sum + row.ads.sales, 0);
+  const totalOrders = rows.reduce((sum, row) => sum + row.ads.orders, 0);
+  const observedAcos = totalSales > 0 ? totalSpend / totalSales : null;
+  const actionCount = rows.filter(row => row.decision.priority <= 3).length;
+  const scaleCount = rows.filter(row => row.decision.priority === 3).length;
+  const controlCount = rows.filter(row => row.decision.priority <= 2).length;
+  const observeCount = rows.length - actionCount;
+  const growingCount = rows.filter(row => row.market7d.label === '需求增长').length;
+  const fallingCount = rows.filter(row => row.market7d.label === '需求回落').length;
+  const organicUpCount = rows.filter(row => Number.isFinite(row.organic7d?.change) && row.organic7d.change < 0).length;
+  const organicDownCount = rows.filter(row => Number.isFinite(row.organic7d?.change) && row.organic7d.change > 0).length;
+  const generatedAt = new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
+
+  const bodyRows = rows.map(row => {
+    const acos = row.ads.sales > 0 ? `${(row.ads.spend / row.ads.sales * 100).toFixed(1)}%` : '—';
+    const ctr = row.ads.impressions > 0 ? `${(row.ads.clicks / row.ads.impressions * 100).toFixed(2)}%` : '—';
+    const cpc = row.ads.clicks > 0 ? `$${formatNumber(row.ads.spend / row.ads.clicks, 2)}` : '—';
+    const cvr = row.ads.clicks > 0 ? `${(row.ads.orders / row.ads.clicks * 100).toFixed(1)}%` : '—';
+    const suggestedCpc = Number.isFinite(row.decision.suggestedCpc) ? `$${formatNumber(row.decision.suggestedCpc, 2)}` : '—';
+    const sifBid = row.sifBid.low && row.sifBid.high
+      ? `$${formatNumber(row.sifBid.low, 2)}–$${formatNumber(row.sifBid.high, 2)}`
+      : Number.isFinite(row.sifBid.midpoint) ? `$${formatNumber(row.sifBid.midpoint, 2)}` : '—';
+    const competitor = row.topCompetitorAsin
+      ? `<a href="https://www.amazon.com/dp/${escapeHtml(row.topCompetitorAsin)}" target="_blank" rel="noreferrer">${escapeHtml(row.topCompetitorAsin)}</a>`
+      : '数据缺失';
+    return `<tr data-action="${escapeHtml(row.decision.label)}" data-keyword="${escapeHtml(row.keyword.toLowerCase())}">
+      <td class="sticky"><strong>${escapeHtml(row.keyword)}</strong></td>
+      <td>${formatNumber(row.searchVolume)}</td>
+      <td>${escapeHtml(row.trend)}</td>
+      <td><strong>${escapeHtml(row.market7d.label)}</strong><br><span class="sub">${signedPercent(row.market7d.volume.rate)}</span></td>
+      <td>${rankMovement(row.market7d.abaRank)}</td>
+      <td>${signedPercent(row.market7d.clickShare.rate)}</td>
+      <td>${escapeHtml(rankText(row.organicRank))}</td>
+      <td>${rankMovement(row.organic7d)}</td>
+      <td>${escapeHtml(rankText(row.adRank))}</td>
+      <td>${rankMovement(row.adRank7d)}</td>
+      <td>${competitor}</td>
+      <td>${row.topCompetitorShare ? `${(row.topCompetitorShare * 100).toFixed(1)}%` : '—'}</td>
+      <td>${formatNumber(row.ads.impressions)}</td>
+      <td>${formatNumber(row.ads.clicks)}</td>
+      <td>${ctr}</td>
+      <td>${cpc}</td>
+      <td>$${formatNumber(row.ads.spend, 2)}</td>
+      <td>${formatNumber(row.ads.orders)}</td>
+      <td>${cvr}</td>
+      <td>${acos}</td>
+      <td>${sifBid}</td>
+      <td>${suggestedCpc}</td>
+      <td><span class="tag p${row.decision.priority}">${escapeHtml(row.decision.label)}</span></td>
+      <td class="advice">${escapeHtml(row.decision.advice)}</td>
+    </tr>`;
+  }).join('\n');
+
+  return `<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>${escapeHtml(task.asin)} 关键词作战报告</title>
+  <style>
+    :root{color-scheme:light;--ink:#102040;--muted:#66758f;--line:#dfe6f2;--blue:#2864e8;--navy:#123773;--red:#c9372c;--amber:#b77905;--green:#067647;--bg:#f1f5fb}
+    *{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.55 system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
+    .shell{display:grid;grid-template-columns:220px minmax(0,1fr);gap:20px;max-width:1720px;margin:0 auto;padding:20px}.side{position:sticky;top:20px;height:calc(100vh - 40px);background:#fff;border:1px solid var(--line);border-radius:18px;padding:20px;box-shadow:0 12px 34px rgba(27,54,99,.07)}
+    .brand{font-size:17px;font-weight:800}.asin{color:var(--muted);font-size:12px;margin:3px 0 20px}.nav a{display:flex;gap:10px;color:#42526e;text-decoration:none;padding:11px 12px;border-radius:10px;margin:5px 0;font-weight:650}.nav a.active,.nav a:hover{background:#edf4ff;color:var(--blue)}.nav b{color:#8ca0bf;font-size:11px}
+    main{min-width:0}.hero{position:relative;overflow:hidden;background:linear-gradient(125deg,#123773,#2864e8);color:#fff;padding:30px;border-radius:20px;box-shadow:0 18px 46px rgba(30,85,190,.2)}.hero:after{content:"";position:absolute;width:340px;height:340px;border:56px solid rgba(255,255,255,.07);border-radius:50%;right:-90px;top:-150px}
+    h1{margin:0 0 8px;font-size:30px}.sub{opacity:.82}.eyebrow{font-size:11px;letter-spacing:.16em;font-weight:800;color:#a9c8ff;margin-bottom:8px}.cards{display:grid;grid-template-columns:repeat(4,minmax(150px,1fr));gap:12px;margin:18px 0}
+    .card{background:#fff;border:1px solid var(--line);border-radius:15px;padding:17px;box-shadow:0 8px 24px rgba(31,55,95,.04)}.card span{display:block;color:var(--muted);font-size:12px}.card strong{display:block;margin-top:5px;font-size:25px}.decision-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:18px}.decision{background:#fff;border:1px solid var(--line);border-radius:15px;padding:16px;border-top:3px solid var(--blue)}.decision.danger{border-top-color:var(--red)}.decision.good{border-top-color:var(--green)}.decision span{color:var(--muted)}.decision strong{display:block;font-size:22px;margin-top:5px}
+    .panel{background:#fff;border:1px solid var(--line);border-radius:16px;overflow:hidden;box-shadow:0 10px 30px rgba(31,55,95,.05)}.panel-head{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:16px 18px;border-bottom:1px solid var(--line)}.tools{display:flex;gap:8px;flex-wrap:wrap}.tools input,.tools select,.tools button{border:1px solid var(--line);border-radius:9px;padding:9px 11px;background:#f9fbfe;color:var(--ink)}.tools button{border-color:var(--blue);background:var(--blue);color:#fff;font-weight:750;cursor:pointer}.tools button:hover{filter:brightness(.94)}
+    .table-wrap{overflow:auto;max-height:72vh}table{border-collapse:separate;border-spacing:0;min-width:2350px;width:100%}th,td{padding:12px;border-bottom:1px solid var(--line);vertical-align:top;text-align:left;white-space:nowrap}
+    th{position:sticky;top:0;background:#edf3fd;z-index:2;font-size:12px;color:#41577a}.sticky{position:sticky;left:0;background:#fff;z-index:1;min-width:230px}.advice{white-space:normal;min-width:340px;color:#42526e}
+    .tag{display:inline-block;border-radius:999px;padding:3px 9px;font-weight:700}.p1,.p2{background:#fee4e2;color:var(--red)}.p3{background:#dcfae6;color:var(--green)}.p4{background:#fef0c7;color:var(--amber)}.p5,.p6{background:#eef2f7;color:#475467}
+    .report-view{display:none}.report-view.active{display:block}.decision-grid.report-view.active{display:grid}.method-card{background:#fff;border:1px solid var(--line);border-radius:16px;padding:22px}.method-card h2{margin-top:0}.method-card li{margin:9px 0;color:#42526e}.note{margin:14px 4px;color:var(--muted);font-size:12px}@media(max-width:900px){.shell{display:block;padding:12px}.side{position:static;height:auto;margin-bottom:12px}.nav{display:flex;overflow:auto}.nav a{white-space:nowrap}.cards{grid-template-columns:1fr 1fr}.decision-grid{grid-template-columns:1fr}.hero{padding:22px}h1{font-size:23px}}
+  </style>
+</head>
+<body><div class="shell">
+<aside class="side"><div class="brand">关键词作战报告</div><div class="asin">${escapeHtml(task.asin)}</div><nav class="nav"><a href="#overview" class="active" data-view="overview"><b>01</b>决策总览</a><a href="#actions" data-view="actions"><b>02</b>动作摘要</a><a href="#trends" data-view="trends"><b>03</b>7天趋势</a><a href="#battle" data-view="battle"><b>04</b>关键词作战表</a><a href="#method" data-view="method"><b>05</b>数据口径</a></nav></aside>
+<main>
+  <section class="hero"><div class="eyebrow">KEYWORD INTELLIGENCE</div><h1>${escapeHtml(task.asin)} 关键词作战报告</h1><div class="sub">美国站 · SIF 前 ${rows.length} 个核心词 · 生成于 ${escapeHtml(generatedAt)}</div></section>
+  <section class="report-view active" id="overview"><div class="cards">
+    <div class="card"><span>核心关键词</span><strong>${rows.length}</strong></div>
+    <div class="card"><span>优先动作词</span><strong>${actionCount}</strong></div>
+    <div class="card"><span>样本广告花费</span><strong>$${formatNumber(totalSpend, 2)}</strong></div>
+    <div class="card"><span>样本广告订单</span><strong>${formatNumber(totalOrders)}</strong></div>
+    <div class="card"><span>目标 ACOS</span><strong>30.0%</strong></div>
+    <div class="card"><span>样本实际 ACOS</span><strong>${observedAcos === null ? '—' : `${(observedAcos * 100).toFixed(1)}%`}</strong></div>
+  </div><div class="method-card"><h2>本轮运营结论</h2><p>共识别 ${rows.length} 个核心词，其中 ${controlCount} 个需要优先止损或控制成本，${scaleCount} 个建议放量，${observeCount} 个继续观察。</p></div></section>
+  <section class="decision-grid report-view" id="actions"><div class="decision danger"><span>否词止损 / 降价控本</span><strong>${controlCount}</strong></div><div class="decision good"><span>加词承接</span><strong>${scaleCount}</strong></div><div class="decision"><span>测试 / 守位 / 观察</span><strong>${observeCount}</strong></div></section>
+  <section class="report-view" id="trends"><div class="cards"><div class="card"><span>7天需求增长词</span><strong>${growingCount}</strong></div><div class="card"><span>7天需求回落词</span><strong>${fallingCount}</strong></div><div class="card"><span>自身自然位提升</span><strong>${organicUpCount}</strong></div><div class="card"><span>自身自然位下滑</span><strong>${organicDownCount}</strong></div></div><div class="method-card"><h2>7天趋势判断</h2><p>市场趋势来自 SIF 周粒度历史；自然位和广告位趋势来自竞争接口的排名演化。ABA 排名是关键词市场热度排名，不等同于本商品自然排名。</p><p>若头部前三点击份额持续上升，说明流量向头部集中；即使搜索量增长，也应优先从长尾词和高转化精准词切入。</p></div></section>
+  <section class="panel report-view" id="battle"><div class="panel-head"><div><strong>关键词作战总表</strong><div class="sub" style="color:var(--muted)">按否词止损 → 降价控本 → 加词承接 → 新机会 → 观察排序</div></div><div class="tools"><input id="keywordSearch" placeholder="搜索关键词"><select id="actionFilter"><option value="">全部动作</option><option>否词止损</option><option>降价控本</option><option>小幅降价</option><option>加词承接</option><option>新增测试</option><option>长尾切入</option><option>守自然位</option><option>继续观察</option></select><button id="exportCsv" type="button">导出执行清单</button></div></div>
+    <div class="table-wrap"><table><thead><tr>
+      <th class="sticky">关键词</th><th>月搜索量</th><th>需求趋势</th><th>7天市场趋势</th><th>ABA排名变化</th><th>Top3点击集中度变化</th><th>自然位</th><th>自然位7天</th><th>广告位</th><th>广告位7天</th><th>头部竞品</th><th>头部最高渠道份额</th><th>曝光</th><th>点击</th><th>CTR</th><th>CPC</th><th>花费</th><th>订单</th><th>CVR</th><th>ACOS</th><th>SIF建议竞价</th><th>规则建议 CPC</th><th>动作</th><th>触发原因与操作</th>
+    </tr></thead><tbody>${bodyRows}</tbody></table></div>
+  </section>
+  <section class="method-card report-view" id="method"><h2>数据口径与说明</h2><ul><li>广告指标来自本次上传的搜索词报表，并按搜索词聚合。</li><li>关键词需求、周趋势、自然位、广告位和竞品信息来自 SIF；数据通常延迟 1 天。</li><li>目标 ACOS 固定为用户提供的 30%；规则建议 CPC = 每点击销售额 × 30% × 0.95。</li><li>SIF 建议竞价是市场参考，不会覆盖盈亏安全竞价，也不会单独触发加价。</li><li>“—”表示源接口没有对应字段；调用失败时保留数据缺失，不阻断整个任务。</li><li>动作建议用于运营复核，不会自动修改亚马逊广告活动；调整后观察 3–5 天。</li></ul></section>
+  <p class="note">报告生成时间：${escapeHtml(generatedAt)}</p>
+</main></div><script>
+const q=document.getElementById('keywordSearch'),f=document.getElementById('actionFilter'),trs=[...document.querySelectorAll('tbody tr')];
+const navs=[...document.querySelectorAll('.nav a')],views=[...document.querySelectorAll('.report-view')];
+function showView(name){navs.forEach(a=>a.classList.toggle('active',a.dataset.view===name));views.forEach(v=>v.classList.toggle('active',v.id===name));window.scrollTo({top:0,behavior:'smooth'})}
+navs.forEach(a=>a.addEventListener('click',e=>{e.preventDefault();showView(a.dataset.view)}));
+function filterRows(){const k=q.value.trim().toLowerCase(),a=f.value;trs.forEach(r=>r.hidden=!!((k&&!r.dataset.keyword.includes(k))||(a&&!r.dataset.action.includes(a))))}
+q.addEventListener('input',filterRows);f.addEventListener('change',filterRows);
+document.getElementById('exportCsv').addEventListener('click',()=>{
+  const headers=[...document.querySelectorAll('thead th')].map(x=>x.innerText.trim());
+  const visible=trs.filter(r=>!r.hidden);
+  const csv=[headers,...visible.map(r=>[...r.cells].map(c=>c.innerText.trim()))]
+    .map(row=>row.map(v=>'"'+String(v).replace(/"/g,'""')+'"').join(',')).join('\r\n');
+  const blob=new Blob(['\ufeff'+csv],{type:'text/csv;charset=utf-8'}),url=URL.createObjectURL(blob),a=document.createElement('a');
+  a.href=url;a.download='${escapeHtml(task.asin)}-广告执行清单.csv';document.body.appendChild(a);a.click();a.remove();URL.revokeObjectURL(url);
+});
+</script></body></html>`;
+}
+
+async function markFailed(taskId, reason) {
+  const safeReason = String(reason || '未知错误').slice(0, 1000);
+  const { error } = await supabase
+    .from('keyword_tasks')
+    .update({ status: '失败', failure_reason: safeReason, report_url: null })
+    .eq('id', taskId);
+  if (error) console.error(`任务 ${taskId} 写入失败状态时出错：${error.message}`);
+}
+
+async function processTask(task) {
+  console.log(`开始领取任务 ${task.id}，ASIN ${task.asin}`);
+  const { data: claimedRows, error: claimError } = await supabase
+    .from('keyword_tasks')
+    .update({ status: '进行中', failure_reason: null, report_url: null })
+    .eq('id', task.id)
+    .eq('status', '待处理')
+    .select('id');
+  if (claimError) throw claimError;
+  if (!claimedRows || claimedRows.length !== 1) {
+    console.log(`任务 ${task.id} 已被其他 worker 领取，跳过。`);
+    return;
+  }
+
+  try {
+    console.log(`任务 ${task.id}：下载并解析广告报表 ${task.report_path}`);
+    const input = await downloadAdvertisingReport(task);
+    const adReport = parseAdvertisingWorkbook(input, task.report_path);
+    const rows = await buildKeywordRows(task, adReport);
+    const html = renderHtmlReport(task, rows, adReport);
+    const objectKey = reportObjectKey(task);
+
+    console.log(`任务 ${task.id}：上传 HTML 报告到 COS ${objectKey}`);
+    await putObject({
+      Bucket: process.env.COS_BUCKET,
+      Region: process.env.COS_REGION,
+      Key: objectKey,
+      Body: Buffer.from(html, 'utf8'),
+      ContentType: 'text/html; charset=utf-8'
+    });
+    const reportUrl = await getSignedObjectUrl(objectKey);
+    const { error: completeError } = await supabase
+      .from('keyword_tasks')
+      .update({ status: '已完成', failure_reason: null, report_url: reportUrl })
+      .eq('id', task.id)
+      .eq('status', '进行中');
+    if (completeError) throw completeError;
+
+    if (String(process.env.DELETE_SOURCE_AFTER_SUCCESS).toLowerCase() === 'true') {
+      const { error: removeError } = await supabase.storage
+        .from(INBOX_BUCKET)
+        .remove([task.report_path]);
+      if (removeError) console.warn(`任务 ${task.id} 删除源报表失败：${removeError.message}`);
+    }
+    console.log(`任务 ${task.id} 已完成，真实 HTML 报告已上传。`);
+  } catch (error) {
+    console.error(`任务 ${task.id} 处理失败：${error.message}`);
+    await markFailed(task.id, error.message);
+  }
+}
+
+async function refreshCompletedReportUrls() {
+  if (refreshingUrls) return;
+  refreshingUrls = true;
+  try {
+    const { data, error } = await supabase
+      .from('keyword_tasks')
+      .select('id, user_id, report_url')
+      .eq('status', '已完成')
+      .order('updated_at', { ascending: false })
+      .limit(100);
+    if (error) throw error;
+    for (const task of data || []) {
+      // 阶段 6 的历史 CSV 仍使用自己的签名地址；不要把它误改成不存在的 HTML。
+      if (!String(task.report_url || '').includes('.html')) continue;
+      const reportUrl = await getSignedObjectUrl(reportObjectKey(task));
+      const { error: updateError } = await supabase
+        .from('keyword_tasks')
+        .update({ report_url: reportUrl })
+        .eq('id', task.id)
+        .eq('status', '已完成');
+      if (updateError) console.warn(`任务 ${task.id} 刷新报告链接失败：${updateError.message}`);
+    }
+    if (data?.length) console.log(`已刷新 ${data.length} 个已完成任务的报告签名链接。`);
+  } catch (error) {
+    console.error(`刷新报告链接失败：${error.message}`);
+  } finally {
+    refreshingUrls = false;
+  }
+}
+
+async function pollTasks() {
+  if (polling) return;
+  polling = true;
+  try {
+    const { data, error } = await supabase
+      .from('keyword_tasks')
+      .select('id, user_id, asin, report_path, created_at')
+      .eq('status', '待处理')
+      .order('created_at', { ascending: true })
+      .limit(1);
+    if (error) throw error;
+    if (!data || data.length === 0) {
+      console.log(`[${new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}] 无新任务`);
+      return;
+    }
+    await processTask(data[0]);
+  } catch (error) {
+    console.error(`轮询任务失败：${error.message}`);
+  } finally {
+    polling = false;
+  }
+}
+
+console.log(`阶段 7 worker 已启动：每 30 秒检查任务，SIF 小样上限 ${KEYWORD_LIMIT} 个词。`);
+pollTasks();
+refreshCompletedReportUrls();
+setInterval(pollTasks, POLL_INTERVAL_MS);
+setInterval(refreshCompletedReportUrls, URL_REFRESH_INTERVAL_MS);
