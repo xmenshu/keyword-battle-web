@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>关键词作战工具</title>
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <style>
+    :root{--navy:#173b7a;--blue:#2f63d8;--blue2:#3977ef;--bg:#f3f6fb;--text:#172033;--muted:#667085;--line:#dce4f0;--green:#079455;--red:#d92d20;--amber:#d99a00}
+    *{box-sizing:border-box}body{margin:0;font-family:Inter,Arial,"Microsoft YaHei",sans-serif;background:var(--bg);color:var(--text)}button,input{font:inherit}.hidden{display:none!important}
+    .topbar{height:68px;background:#fff;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;padding:0 max(24px,calc((100vw - 1440px)/2));position:sticky;top:0;z-index:10}.brand{display:flex;align-items:center;gap:12px;font-weight:800;color:var(--navy)}.brand-mark{width:36px;height:36px;border-radius:11px;display:grid;place-items:center;color:#fff;background:linear-gradient(145deg,var(--navy),var(--blue2));box-shadow:0 8px 18px rgba(47,99,216,.24)}.top-note{font-size:13px;color:var(--muted)}
+    .wrap{max-width:1440px;margin:0 auto;padding:30px 24px 48px}.hero{background:linear-gradient(120deg,#173b7a,#2f63d8 72%,#3977ef);color:#fff;border-radius:22px;padding:34px 38px;position:relative;overflow:hidden;box-shadow:0 18px 45px rgba(23,59,122,.16);margin-bottom:22px}.hero:after{content:"";position:absolute;width:360px;height:360px;border:70px solid rgba(255,255,255,.06);border-radius:50%;right:-100px;top:-190px}.hero h1{font-size:30px;margin:0 0 10px}.hero p{margin:0;color:rgba(255,255,255,.78);line-height:1.7}.eyebrow{font-size:12px;font-weight:800;letter-spacing:.12em;text-transform:uppercase;color:#91b7ff;margin-bottom:10px}
+    .card{background:#fff;border:1px solid rgba(220,228,240,.95);border-radius:18px;padding:24px;box-shadow:0 8px 28px rgba(30,60,100,.06)}.auth-card{max-width:480px;margin:28px auto}.section-title{display:flex;align-items:flex-start;justify-content:space-between;gap:18px;margin-bottom:18px}.section-title h2{font-size:20px;margin:0 0 5px}.muted{color:var(--muted);font-size:14px;line-height:1.6}
+    input{width:100%;padding:13px 14px;margin-top:11px;border-radius:10px;border:1px solid var(--line);background:#fbfcfe;color:var(--text);outline:none}input:focus{border-color:var(--blue);box-shadow:0 0 0 3px rgba(47,99,216,.1);background:#fff}button{border:0;border-radius:10px;padding:12px 18px;color:#fff;background:var(--blue);cursor:pointer;font-weight:700;transition:.18s}button:hover{transform:translateY(-1px);box-shadow:0 8px 18px rgba(47,99,216,.18)}button.secondary{background:#eef3fb;color:var(--navy)}button.ghost{background:#fff;color:var(--navy);border:1px solid var(--line)}button:disabled{opacity:.55;cursor:not-allowed;transform:none}.row{display:grid;grid-template-columns:1fr 1fr;gap:12px}.auth-actions{margin-top:14px}.forgot{display:block;width:max-content;margin:13px 0 0 auto;color:var(--blue);text-decoration:none;font-size:14px}.message{margin-top:13px;font-size:14px;min-height:20px}
+    .stats{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:18px}.stat{background:#fff;border:1px solid var(--line);border-radius:16px;padding:20px;position:relative;overflow:hidden}.stat:before{content:"";position:absolute;left:0;top:0;bottom:0;width:4px;background:var(--blue)}.stat.green:before{background:var(--green)}.stat.amber:before{background:var(--amber)}.stat.red:before{background:var(--red)}.stat-label{font-size:13px;color:var(--muted)}.stat-value{font-size:28px;font-weight:800;color:var(--navy);margin-top:8px}
+    .dashboard-grid{display:grid;grid-template-columns:minmax(0,1.05fr) minmax(0,1.6fr);gap:18px}.upload-box{border:1px dashed #b7c7df;border-radius:13px;background:#f8faff;padding:16px;margin-top:12px}.upload-box input[type=file]{background:#fff}.full{width:100%;margin-top:12px}.task-list{display:grid;gap:10px}.task{border:1px solid var(--line);border-radius:13px;padding:15px 16px;display:grid;grid-template-columns:1fr auto;gap:12px;align-items:center}.task-main{min-width:0}.task-top{display:flex;align-items:center;gap:10px;margin-bottom:5px}.task-asin{font-weight:800;color:var(--navy)}.pill{display:inline-flex;align-items:center;border-radius:999px;padding:4px 9px;font-size:12px;font-weight:800;background:#eaf2ff;color:var(--blue)}.pill.done{background:#e8f7f0;color:var(--green)}.pill.failed{background:#fff0ee;color:var(--red)}.report-link{display:inline-flex;text-decoration:none;border-radius:9px;padding:9px 13px;background:#edf3ff;color:var(--blue);font-size:13px;font-weight:800;white-space:nowrap}.empty{padding:38px;text-align:center;color:var(--muted);border:1px dashed var(--line);border-radius:13px}
+    @media(max-width:900px){.stats{grid-template-columns:1fr 1fr}.dashboard-grid{grid-template-columns:1fr}.top-note{display:none}}@media(max-width:620px){.wrap{padding:16px 12px 30px}.topbar{height:60px;padding:0 14px}.hero{padding:26px 22px;border-radius:17px}.hero h1{font-size:25px}.stats{grid-template-columns:1fr 1fr;gap:10px}.stat{padding:16px}.stat-value{font-size:23px}.row{grid-template-columns:1fr}.task{grid-template-columns:1fr}.report-link{justify-content:center}.card{padding:18px}}
+  </style>
+</head>
+<body>
+  <header class="topbar"><div class="brand"><span class="brand-mark">K</span><span>关键词作战</span></div><div class="top-note">Amazon Ads 智能分析工作台</div></header>
+  <main class="wrap">
+    <section class="hero"><div class="eyebrow">Keyword Intelligence</div><h1>把广告数据变成清晰的增长动作</h1><p>上传搜索词报告，自动整合广告表现、关键词需求、竞品格局与 AI 判断。</p></section>
+    <section id="authCard" class="card auth-card">
+      <div class="section-title"><div><h2>欢迎回来</h2><div class="muted">登录后查看和创建分析任务</div></div></div>
+      <input id="email" type="email" autocomplete="email" placeholder="邮箱">
+      <input id="password" type="password" autocomplete="current-password" placeholder="密码">
+      <a class="forgot" href="#" onclick="forgotPassword(event)">忘记密码？</a>
+      <div class="row auth-actions"><button id="loginButton" onclick="login()">登录工作台</button><button class="secondary" onclick="signup()">创建账号</button></div>
+      <div id="authMessage" class="message" role="status"></div>
+    </section>
+    <div id="appCard" class="hidden">
+      <div class="section-title"><div><div class="eyebrow">Dashboard</div><h2>分析工作台</h2><div id="currentUser" class="muted"></div></div><button class="ghost" onclick="logout()">退出登录</button></div>
+      <section class="stats"><div class="stat"><div class="stat-label">全部任务</div><div id="statTotal" class="stat-value">—</div></div><div class="stat green"><div class="stat-label">已完成</div><div id="statDone" class="stat-value">—</div></div><div class="stat amber"><div class="stat-label">处理中</div><div id="statPending" class="stat-value">—</div></div><div class="stat red"><div class="stat-label">失败任务</div><div id="statFailed" class="stat-value">—</div></div></section>
+      <div class="dashboard-grid">
+        <section class="card"><div class="section-title"><div><h2>新建分析任务</h2><div class="muted">填写 ASIN 并上传对应广告搜索词报表</div></div></div><input id="asin" placeholder="输入 ASIN，例如 B0XXXXXXXX"><div class="upload-box"><div class="muted">支持 CSV、XLSX，建议上传最新周期报表</div><input id="reportFile" type="file" accept=".csv,.xlsx"></div><button id="submitButton" class="full" onclick="createTask()">上传并开始分析</button><div id="taskMessage" class="message"></div></section>
+        <section id="listCard" class="card"><div class="section-title"><div><h2>最近报告</h2><div class="muted">状态每 30 秒自动更新</div></div></div><div id="taskList" class="task-list"><div class="empty">正在读取任务……</div></div></section>
+      </div>
+    </div>
+  </main>
+  <script>
+    const SUPABASE_URL='https://cwqelnkhcscrozlggcim.supabase.co';
+    const SUPABASE_KEY='sb_publishable_TnkdSnkam2DaK1_K5YwGpw_gRoGUYkN';
+    const client=supabase.createClient(SUPABASE_URL,SUPABASE_KEY);
+    const showMessage=(id,text,error=false)=>{const el=document.getElementById(id);el.textContent=text;el.style.color=error?'#d92d20':'#079455'};
+    const validEmail=email=>/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+
+    async function login(){
+      const button=document.getElementById('loginButton');
+      const email=document.getElementById('email').value.trim();
+      const password=document.getElementById('password').value;
+      if(!validEmail(email))return showMessage('authMessage','请输入正确的邮箱地址',true);
+      if(!password)return showMessage('authMessage','请输入密码',true);
+      button.disabled=true;showMessage('authMessage','正在登录……');
+      const{error}=await client.auth.signInWithPassword({email,password});button.disabled=false;
+      if(error)return showMessage('authMessage','邮箱或密码不正确',true);
+      showMessage('authMessage','登录成功');refreshPage();
+    }
+
+    async function signup(){
+      const email=document.getElementById('email').value.trim();
+      const password=document.getElementById('password').value;
+      if(!validEmail(email))return showMessage('authMessage','请输入正确的邮箱地址',true);
+      if(password.length<8)return showMessage('authMessage','密码至少需要 8 位',true);
+      const{error}=await client.auth.signUp({email,password});
+      if(error)return showMessage('authMessage',error.message,true);
+      showMessage('authMessage','注册成功，请前往邮箱完成验证');
+    }
+
+    async function forgotPassword(event){
+      event.preventDefault();
+      const email=document.getElementById('email').value.trim();
+      if(!validEmail(email))return showMessage('authMessage','请先在邮箱框填写正确的注册邮箱',true);
+      showMessage('authMessage','正在发送重置邮件……');
+      const{error}=await client.auth.resetPasswordForEmail(email,{redirectTo:'https://www.xmenshu.com/reset-password.html'});
+      if(error)return showMessage('authMessage','发送失败，请稍后重试',true);
+      showMessage('authMessage','如果该邮箱已注册，重置密码邮件已发送，请检查收件箱和垃圾邮件');
+    }
+
+    async function logout(){await client.auth.signOut();refreshPage()}
+    async function refreshPage(){
+      const{data:{user}}=await client.auth.getUser();const loggedIn=Boolean(user);
+      document.getElementById('authCard').classList.toggle('hidden',loggedIn);
+      document.getElementById('appCard').classList.toggle('hidden',!loggedIn);
+      document.getElementById('listCard').classList.toggle('hidden',!loggedIn);
+      if(user){document.getElementById('currentUser').textContent=user.email;loadTasks()}
+    }
+
+    async function createTask(){
+      const button=document.getElementById('submitButton');const asin=document.getElementById('asin').value.trim().toUpperCase();const file=document.getElementById('reportFile').files[0];
+      if(!asin)return showMessage('taskMessage','请填写 ASIN',true);if(!file)return showMessage('taskMessage','请选择 CSV 或 XLSX 文件',true);
+      const extension=file.name.split('.').pop().toLowerCase();if(!['csv','xlsx'].includes(extension))return showMessage('taskMessage','只允许上传 CSV 或 XLSX 文件',true);
+      button.disabled=true;showMessage('taskMessage','正在上传……');
+      try{
+        const{data:{user}}=await client.auth.getUser();if(!user)throw new Error('请先登录');
+        const taskId=crypto.randomUUID();const reportPath=`${user.id}/${taskId}.${extension}`;
+        const{error:uploadError}=await client.storage.from('keyword-task-inbox').upload(reportPath,file,{upsert:false});if(uploadError)throw uploadError;
+        const{error:insertError}=await client.from('keyword_tasks').insert({id:taskId,user_id:user.id,asin,report_path:reportPath,status:'待处理'});if(insertError)throw insertError;
+        document.getElementById('asin').value='';document.getElementById('reportFile').value='';showMessage('taskMessage','任务创建成功，服务器即将开始处理');loadTasks();
+      }catch(error){showMessage('taskMessage',error.message,true)}finally{button.disabled=false}
+    }
+
+    async function loadTasks(){
+      const list=document.getElementById('taskList');const{data,error}=await client.from('keyword_tasks').select('id,asin,status,failure_reason,report_url,created_at').order('created_at',{ascending:false}).limit(30);
+      if(error){list.innerHTML=`<div class="empty">读取失败：${error.message}</div>`;return}
+      const rows=data||[];document.getElementById('statTotal').textContent=rows.length;document.getElementById('statDone').textContent=rows.filter(x=>x.status==='已完成').length;document.getElementById('statFailed').textContent=rows.filter(x=>x.status==='失败').length;document.getElementById('statPending').textContent=rows.filter(x=>!['已完成','失败'].includes(x.status)).length;
+      if(rows.length===0){list.innerHTML='<div class="empty">暂无任务，创建第一份分析报告吧。</div>';return}
+      list.innerHTML=rows.map(task=>{const statusClass=task.status==='已完成'?'done':task.status==='失败'?'failed':'';const report=task.report_url?`<a class="report-link" href="${task.report_url}" target="_blank" rel="noopener">打开报告 →</a>`:'';const failure=task.failure_reason?`<div class="failed">失败原因：${task.failure_reason}</div>`:'';return `<article class="task"><div class="task-main"><div class="task-top"><span class="task-asin">${task.asin}</span><span class="pill ${statusClass}">${task.status}</span></div><div class="muted">${new Date(task.created_at).toLocaleString()}</div>${failure}</div>${report}</article>`}).join('');
+    }
+    client.auth.onAuthStateChange(()=>refreshPage());refreshPage();setInterval(()=>{if(!document.getElementById('listCard').classList.contains('hidden'))loadTasks()},30000);
+  </script>
+</body>
+</html>
